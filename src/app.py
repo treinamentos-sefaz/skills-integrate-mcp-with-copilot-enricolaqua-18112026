@@ -5,11 +5,22 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+import logging
 import os
+import secrets
+import threading
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
+
+if __package__:
+    from .auth import verify_teacher
+else:
+    from auth import verify_teacher
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +29,80 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+logger = logging.getLogger(__name__)
+sessions: dict[str, float] = {}
+sessions_lock = threading.Lock()
+SESSION_SECONDS = 8 * 60 * 60
+
+
+class LoginCredentials(BaseModel):
+    username: str
+    password: str
+
+
+def check_origin(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc != request.headers.get("host"):
+        raise HTTPException(status_code=403, detail="Invalid request origin")
+    if origin and urlsplit(origin).scheme != request.url.scheme:
+        raise HTTPException(status_code=403, detail="Invalid request origin")
+
+
+def require_teacher(request: Request) -> None:
+    check_origin(request)
+    token = request.cookies.get("teacher_session")
+    with sessions_lock:
+        expires = sessions.get(token, 0) if token else 0
+        if expires <= time.monotonic():
+            if token:
+                sessions.pop(token, None)
+            raise HTTPException(status_code=401, detail="Teacher login required")
+
+
+@app.post("/auth/login")
+def login(credentials: LoginCredentials, request: Request, response: Response):
+    check_origin(request)
+    try:
+        valid = verify_teacher(credentials.username, credentials.password)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        logger.exception("Could not read teacher credentials")
+        raise HTTPException(status_code=503, detail="Teacher login is not configured") from exc
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = secrets.token_urlsafe(32)
+    with sessions_lock:
+        now = time.monotonic()
+        for expired in [key for key, expiry in sessions.items() if expiry <= now]:
+            del sessions[expired]
+        sessions[token] = now + SESSION_SECONDS
+    response.set_cookie(
+        "teacher_session", token, max_age=SESSION_SECONDS, httponly=True,
+        samesite="strict", secure=request.url.scheme == "https",
+    )
+    return {"message": "Logged in"}
+
+
+@app.get("/auth/session")
+def session_status(request: Request):
+    try:
+        require_teacher(request)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        return {"authenticated": False}
+    return {"authenticated": True}
+
+
+@app.post("/auth/logout", dependencies=[Depends(require_teacher)])
+def logout(request: Request, response: Response):
+    token = request.cookies.get("teacher_session")
+    with sessions_lock:
+        if token:
+            sessions.pop(token, None)
+    response.delete_cookie("teacher_session")
+    return {"message": "Logged out"}
+
 
 # In-memory activity database
 activities = {
@@ -88,7 +173,7 @@ def get_activities():
     return activities
 
 
-@app.post("/activities/{activity_name}/signup")
+@app.post("/activities/{activity_name}/signup", dependencies=[Depends(require_teacher)])
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
@@ -110,7 +195,7 @@ def signup_for_activity(activity_name: str, email: str):
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
+@app.delete("/activities/{activity_name}/unregister", dependencies=[Depends(require_teacher)])
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
     # Validate activity exists
